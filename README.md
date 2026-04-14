@@ -36,7 +36,7 @@ It requires the use of isolated containers (via Docker). To guarantee stability 
 * **`Dockerfile`**: Defines the reproducible container environment. It handles the installation of all necessary system dependencies and R packages via pre-compiled binaries.
 * **`analisis.R`**: The core, fully-automated R script encompassing the full analysis pipeline. It employs strict memory management (`rm()`, `gc()`) to ensure successful execution within the 16 GB RAM constraint.
 * **`Report.Rmd` / `Report.pdf`**: The comprehensive analytical report detailing the methodology, rationale, and interpretation of the results. 
-* **`Rplots.pdf`**: A collection of generated visual outputs, including UMAP projections and Volcano plots highlighting differential expression.
+* **`Rplots.pdf`**: A collection of generated visual outputs. Volcano plots highlighting differential expression.
 * **`resultados/`**: The output directory containing all exported datasets, result matrices, and significant DEGs identified by the pipeline.
 * **`GSM*_data/`**: Directories containing the raw input matrices from public repositories:
   * `GSM3854512_data/`
