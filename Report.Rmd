@@ -1,0 +1,583 @@
+---
+title: "RNA-seq analysis of gliosis in rd1 and rd10 models"
+author: "Alejandro Gombau García"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+header-includes:
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(42)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+library(GEOquery)
+library(Matrix)
+library(Seurat)
+library(DESeq2)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(EnhancedVolcano)
+library(patchwork)
+
+```
+
+RNA-Seq permits the precise and large-scale determination of RNA sequences present within a sample, facilitating the quantification of transcript abundance and the discovery of novel variants or isoforms. It is primarily employed to examine gene expression patterns across different conditions (e.g., studying retinopathies in disease models versus wild-type strains), identify differentially expressed genes, characterize tissue transcriptomes, and detect non-coding RNAs or gene fusions.
+
+Retinal degenerative processes often involve a sequence where chronic loss of ganglion cells and axons induces severe gliosis. This glial environment exacerbates axonal atrophy and neuronal degeneration.
+
+Utilizing RNA-Seq, this analysis investigates these processes using datasets retrieved from GEO (Gene Expression Omnibus). The goal is to elucidate gene expression changes associated with glial activation, inflammation, and the downregulation of neuroprotective molecules, thereby identifying the associated molecular signatures.
+
+The central question addressed through this pipeline is: **Is it feasible to search for IHC markers on a standard laptop using public RNA-seq data?** By conducting this computational evaluation, the analytical pipeline is calibrated for future investigations involving other retinopathy models that may share convergent phenotypes.
+
+# Data Preparation
+
+The dataset originates from the Gene Expression Omnibus (GEO), a public repository for high-throughput gene expression data maintained by NCBI. Single-cell RNA-seq datasets from two recent studies are utilized:
+
+-   Simon CJ, Khabou H, Chaffiol A, Rucli M et al. [Reactivating the phototransduction cascade with a mutation agnostic gene therapy preserves vision in rod-cone dystrophies.](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE286529) iScience 2025. Data from rd10 and rd1 models are obtained from this study.
+-   Heng JS, Hackett SF, Stein-O'Brien GL, Winer BL et al. [Comprehensive analysis of a mouse model of spontaneous uveoretinitis using single-cell RNA sequencing.](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE132229) Proc Natl Acad Sci U S A 2019. Data from the wild-type (C57) model are obtained from this study.
+
+Datasets for *rd16*, *rd12*, and *rd8* mouse strains were unavailable, presenting a potential avenue for future in-house studies.
+
+Initially, data from various retinal samples are downloaded from GEO. Following quality control to remove low-quality instances, cells from each sample are aggregated into a pseudo-bulk representation. This approach simplifies the single-cell RNA-seq data into a format akin to bulk RNA-seq, representing each sample as a single list of genes and their associated read counts, thereby standardizing the input for differential expression analysis.
+
+Extensive code sections dedicated to data downloading, formatting, quality control, and pseudo-bulk construction execute in the background.
+
+```{r include=FALSE}
+
+# Define a vector with sample IDs
+gsm_ids <- c(
+  "GSM8728964", # Retina rd1 mouse sample 1
+  "GSM8728965", # Retina rd1 mouse sample 2
+  "GSM8728966", # Retina rd1 mouse sample 3
+  "GSM8728967", # Retina rd10 mouse sample 1
+  "GSM8728968", # Retina rd10 mouse sample 2
+  "GSM3854512"  # JH21_WT_retina_scRNAseq_R1
+)
+
+# Download metadata for each GSM without quantitative expression series
+gsm_list <- lapply(gsm_ids, function(id) {
+    getGEO(id, GSEMatrix = FALSE)
+})
+
+```
+
+```{r warning=FALSE, include=FALSE}
+# Create a folder for each GSM and download supplementary files
+for (gsm in gsm_ids) {
+  dir.create(paste0(gsm, "_data"), showWarnings = FALSE)
+  getGEOSuppFiles(gsm, makeDirectory = FALSE, baseDir = paste0(gsm, "_data"))
+}
+```
+
+```{r include=FALSE}
+# Verify contents of all folders
+for (gsm in gsm_ids) {
+  cat("Files in", gsm, "_data:\n")
+  print(list.files(paste0(gsm, "_data")))
+  cat("\n")
+}
+```
+
+```{r include=FALSE}
+# Define IDs and folders containing files for each GSM
+gsm_ids <- c(
+  "GSM8728964", 
+  "GSM8728965", 
+  "GSM8728966", 
+  "GSM8728967", 
+  "GSM8728968", 
+  "GSM3854512"
+)
+# Construct folder names for each GSM
+carpetas <- paste0(gsm_ids, "_data")
+
+# Prepare an empty list to store matrices
+lista_expr <- vector("list", length(gsm_ids))
+names(lista_expr) <- gsm_ids
+
+# Loop to read each sample
+for (i in seq_along(gsm_ids)) {
+  gsm   <- gsm_ids[i]
+  dir   <- carpetas[i]
+  
+  # Identify filenames within the folder
+  ficheros <- list.files(dir, full.names = TRUE)
+  
+  # Read barcodes 
+  fn_barcodes <- ficheros[grep("_barcodes.tsv.gz$", ficheros)]
+  barcodes    <- read.delim(fn_barcodes, header = FALSE, stringsAsFactors = FALSE)
+  
+  # Read features or genes 
+  fn_features <- ficheros[grep("_features.tsv.gz$|_genes.tsv.gz$", ficheros)]
+  features    <- read.delim(fn_features, header = FALSE, stringsAsFactors = FALSE)
+  
+  # Read the sparse matrix
+  fn_matrix <- ficheros[grep("_matrix.mtx.gz$", ficheros)]
+  expr_mat  <- readMM(fn_matrix)
+  
+  # Assign row and column names
+  rownames(expr_mat) <- features$V2
+  colnames(expr_mat) <- barcodes$V1
+  
+  # Save the matrix in the list
+  lista_expr[[gsm]] <- expr_mat
+  
+  # Show a brief summary of dimensions
+  cat("->", gsm, ": number of genes =", nrow(expr_mat),
+      ", number of cells =", ncol(expr_mat), "\n")
+  
+  # Free temporary variables
+  rm(expr_mat, barcodes, features)
+  gc()
+}
+
+```
+
+```{r include=FALSE}
+# Make gene names unique for each sample
+for (gsm in names(lista_expr)) {
+  genes_orig      <- rownames(lista_expr[[gsm]])
+  genes_unicos    <- make.unique(genes_orig)
+  rownames(lista_expr[[gsm]]) <- genes_unicos
+  
+  rm(genes_orig, genes_unicos)
+}
+gc()
+
+# Verify duplicated genes in each sample
+for (gsm in names(lista_expr)) {
+  n_dup <- sum(duplicated(rownames(lista_expr[[gsm]])))
+  cat("->", gsm, ": duplicated genes =", n_dup, "\n")
+  
+  rm(n_dup)
+}
+gc()
+
+```
+
+```{r include=FALSE}
+# Initialize an empty list to store Seurat objects
+lista_seurat <- vector("list", length(lista_expr))
+names(lista_seurat) <- names(lista_expr)
+
+# Loop to create each Seurat object
+for (gsm in names(lista_expr)) {
+  lista_seurat[[gsm]] <- CreateSeuratObject(
+    counts  = lista_expr[[gsm]],
+    project = gsm
+  )
+  cat("-> Created Seurat for", gsm, ":",
+      nrow(lista_seurat[[gsm]]), "genes x",
+      ncol(lista_seurat[[gsm]]), "cells\n")
+}
+
+# Remove the original list of matrices and force garbage collection to manage RAM limit
+rm(lista_expr)
+gc()
+
+```
+
+```{r include=FALSE}
+for (gsm in names(lista_seurat)) {
+  seu <- lista_seurat[[gsm]]
+  
+  # Calculate percent.mt if it does not exist
+  if (!"percent.mt" %in% colnames(seu@meta.data)) {
+    seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^mt-")
+    lista_seurat[[gsm]] <- seu  # save the updated object
+  }
+  
+  # Print the summary for that sample
+  cat(">>>", gsm, "<<<\n")
+  cat("Summary of nFeature_RNA:\n")
+  print(summary(seu@meta.data$nFeature_RNA))
+  cat("Summary of percent.mt:\n")
+  print(summary(seu@meta.data$percent.mt))
+  cat("\n-------------------------\n\n")
+  
+  rm(seu)
+}
+gc()
+
+```
+
+```{r include=FALSE}
+# Apply filtering to each Seurat object and display final cell count
+for (gsm in names(lista_seurat)) {
+  seu <- lista_seurat[[gsm]]
+  
+  # Filter objects based on transcripts and mitochondrial RNA fraction
+  seu_filtrado <- subset(
+    seu,
+    subset = nFeature_RNA > 200 & percent.mt < 10
+  )
+  
+  # Save the filtered Seurat object in the list
+  lista_seurat[[gsm]] <- seu_filtrado
+  
+  # Print the number of remaining cells
+  cat("->", gsm, ": cells after QC =", ncol(seu_filtrado), "\n")
+  
+  rm(seu, seu_filtrado)
+}
+gc()
+
+```
+
+```{r include=FALSE}
+# Extract the vector of present genes in each filtered sample using GetAssayData
+lista_genes_por_muestra <- lapply(lista_seurat, function(s) {
+  counts_mat <- GetAssayData(s, layer = "counts")
+  rownames(counts_mat)
+})
+
+# Calculate the intersection to extract common genes
+genes_comunes_QC <- Reduce(intersect, lista_genes_por_muestra)
+
+# Print the number of common genes
+length(genes_comunes_QC)
+
+rm(lista_genes_por_muestra)
+gc()
+
+```
+
+```{r include=FALSE}
+# Create empty matrix: rows = common genes, columns = each sample
+pseudo_bulk_mat_QC <- matrix(
+  0,
+  nrow = length(genes_comunes_QC),
+  ncol = length(lista_seurat),
+  dimnames = list(genes_comunes_QC, names(lista_seurat))
+)
+
+# Traverse each sample and aggregate gene transcript counts
+for (gsm in names(lista_seurat)) {
+  # Extract the counts matrix from the Seurat object
+  counts_qc <- GetAssayData(lista_seurat[[gsm]], layer = "counts")
+  
+  # Select only the common genes
+  submat    <- counts_qc[genes_comunes_QC, , drop = FALSE]
+  
+  # Compute row sums and register in the corresponding pseudo-bulk column
+  pseudo_bulk_mat_QC[, gsm] <- Matrix::rowSums(submat)
+  
+  rm(counts_qc, submat)
+}
+gc()
+
+# Convert the structural matrix format to data.frame
+pseudo_bulk_df_QC <- as.data.frame(pseudo_bulk_mat_QC)
+
+# Print dimensions and dataframe sample
+cat("Dimensions of pseudo-bulk after QC:", dim(pseudo_bulk_df_QC), "\n\n")
+head(pseudo_bulk_df_QC)
+
+# Discard large redundant objects
+rm(pseudo_bulk_mat_QC, lista_seurat)
+gc()
+
+```
+
+```{r include=FALSE}
+# Install and load DESeq2 if necessary
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("DESeq2")
+
+# Create a data.frame with the structural sample information
+colData <- data.frame(
+  sample     = colnames(pseudo_bulk_df_QC),
+  condition  = c(
+    "rd1", "rd1", "rd1",   # GSM8728964, 8965, 8966 correspond to rd1
+    "rd10","rd10",         # GSM8728967, 8968 correspond to rd10
+    "wt"                  # GSM3854512 corresponds to C57 WT
+  ),
+  row.names = colnames(pseudo_bulk_df_QC),
+  stringsAsFactors = FALSE
+)
+colData
+
+```
+
+```{r include=FALSE}
+# Construct the colData data.frame properly formatted
+colData <- data.frame(
+  condition = c(
+    "rd1", "rd1", "rd1",   
+    "rd10","rd10",         
+    "wt"                   
+  ),
+  row.names = colnames(pseudo_bulk_df_QC),
+  stringsAsFactors = FALSE
+)
+
+# Verify dimensional parameters and content
+dim(colData)
+colData
+
+```
+
+# Differential Expression
+
+```{r include=FALSE}
+# Create the DESeqDataSet architecture utilizing the count matrix and colData
+dds <- DESeqDataSetFromMatrix(
+  countData = pseudo_bulk_df_QC,
+  colData   = colData,
+  design    = ~ condition
+)
+
+# Render class overview
+dds
+
+# Execute the core differential expression analysis routine
+dds <- DESeq(dds)
+```
+
+## Contrasts Table
+
+The summarized count matrix generated longitudinally is leveraged alongside `DESeq2` to execute differential comparisons. For individual genes, `DESeq2` derives a log2 fold change (logFC)—delineating proportional regulation ratios—and an adjusted p-value (`padj`) defining structural statistical significance. Only variables meeting standard coverage limits (`baseMean` \>= 6) and satisfying padj \< 0.1 criteria are assigned as structurally differentially expressed.
+
+```{r echo=FALSE}
+# Extract differential outputs across contrast architectures
+res_rd1_vs_wt   <- results(dds, contrast = c("condition", "rd1",  "wt"))
+res_rd10_vs_wt  <- results(dds, contrast = c("condition", "rd10", "wt"))
+res_rd1_vs_rd10 <- results(dds, contrast = c("condition", "rd1",  "rd10"))
+
+# Auxiliary function calculating Total, Up, Down, Base ratios 
+resumen_contraste_pct <- function(res_obj) {
+  # Coerce to structural data.frame
+  df <- as.data.frame(res_obj)
+  # Filter underlying genes possessing mean counts >= 6
+  df_filt <- df[!is.na(df$padj) & df$baseMean >= 6, ]
+  
+  total   <- nrow(df_filt)
+  up      <- sum(df_filt$padj < 0.1 & df_filt$log2FoldChange >  0, na.rm = TRUE)
+  down    <- sum(df_filt$padj < 0.1 & df_filt$log2FoldChange <  0, na.rm = TRUE)
+  pct_up   <- up    / total * 100
+  pct_down <- down  / total * 100
+  
+  return(c(
+    Total   = total,
+    Up      = up,
+    Down    = down,
+    PctUp   = round(pct_up, 2),
+    PctDown = round(pct_down, 2)
+  ))
+}
+
+# Consolidate output ratio framework
+tabla_resumen_pct <- rbind(
+  `rd1_vs_wt`   = resumen_contraste_pct(res_rd1_vs_wt),
+  `rd10_vs_wt`  = resumen_contraste_pct(res_rd10_vs_wt),
+  `rd1_vs_rd10` = resumen_contraste_pct(res_rd1_vs_rd10)
+)
+
+# Output summary layout
+tabla_resumen_pct
+
+```
+
+Results delineate that in the rd1 vs WT contrast, out of 17,466 analyzed genes, 2,716 (approx. 15.6%) present upregulated profiles in rd1, while 2,862 (approx. 16.4%) manifest downregulation. In the rd10 vs WT contrast, of 16,592 genes, 2,657 (approx. 16.0%) are upregulated in rd10 and 2,770 (approx. 16.7%) are downregulated.
+
+Evaluating the comparative rd1 vs rd10 schema, out of 17,490 total targets, only 292 (1.7%) display significant elevation in rd1 and 407 (approx. 2.3%) present elevation in rd10. Both experimental retinopathic vectors profoundly deviate from the initial WT baseline, retaining remarkable structural alignment among themselves.
+
+## Shrinkage Parameterization
+
+The shrinkage method in `DESeq2` adjusts log2 fold change estimates to provide more stable results, particularly for genes with low read counts. Because low-count genes often exhibit high variability, shrinkage reduces false positives by pulling highly uncertain fold changes closer to zero.
+
+We extracted the expression values for established markers of glial reactivity, including astrocytes, Müller glia, and microglia:
+
+"Gfap", "Vim", "S100b", "Aldh1l1", "Rlbp1", "Glul", "Slc1a3", "C1qa", "C1qb", "Trem2", "Aif1"
+
+The results detail the normalized mean read count (`baseMean`), log2 fold change (`log2FoldChange`), standard error (`lfcSE`), p-value, and adjusted p-value (`padj`) for the rd1 vs WT and rd10 vs WT comparisons.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Process adaptive shrinkage for rd1 vs wt 
+resLFC_rd1_vs_wt <- lfcShrink(
+  dds,
+  contrast = c("condition", "rd1", "wt"),
+  type     = "ashr"
+)
+
+# Process adaptive shrinkage for rd10 vs wt
+resLFC_rd10_vs_wt <- lfcShrink(
+  dds,
+  contrast = c("condition", "rd10", "wt"),
+  type     = "ashr"
+)
+
+# Process adaptive shrinkage for rd1 vs rd10 
+resLFC_rd1_vs_rd10 <- lfcShrink(
+  dds,
+  contrast = c("condition", "rd1", "rd10"),
+  type     = "ashr"
+)
+
+# Declare comprehensive gliosis markers
+genes_gliosis <- c(
+  "Gfap", "Vim", "S100b", "Aldh1l1",
+  "Rlbp1", "Glul", "Slc1a3",
+  "C1qa", "C1qb", "Trem2", "Aif1"
+)
+
+# Coerce derived structural data elements
+tablaLFC_rd1  <- as.data.frame(resLFC_rd1_vs_wt)
+tablaLFC_rd10 <- as.data.frame(resLFC_rd10_vs_wt)
+
+# Filter markers parallel defined profiles
+tabla_gliosis_rd1  <- tablaLFC_rd1[rownames(tablaLFC_rd1) %in% genes_gliosis, ]
+tabla_gliosis_rd10 <- tablaLFC_rd10[rownames(tablaLFC_rd10) %in% genes_gliosis, ]
+
+# Output resultant data structures
+head(tabla_gliosis_rd1)
+head(tabla_gliosis_rd10)
+
+
+```
+
+In the rd1 vs WT comparison, nearly all glial markers are significantly upregulated. This points to clear astrogliosis, Müller cell reactivity (Glul, Rlbp1, Slc1a3), and an increase in microglial markers (C1qa, C1qb, Aif1). The rd10 vs WT contrast shows a very similar pattern, although the magnitude of these changes is slightly lower. Overall, these results confirm that gliosis-associated genes are elevated in both models, supporting the role of glial reactivity in retinal degeneration.
+
+# Functional Enrichment Analysis
+
+Functional enrichment analysis identifies biological processes that are overrepresented within a list of differentially expressed genes. Rather than analyzing genes individually, this approach groups them to reveal broader functional trends. Comparing the upregulated genes against the Gene Ontology (Biological Process) database highlights a clear association with gliogenesis and cytoskeletal reorganization.
+
+```{r echo=FALSE}
+# Coerce filtered responses
+df_rd1_vs_wt  <- as.data.frame(resLFC_rd1_vs_wt)
+df_rd10_vs_wt <- as.data.frame(resLFC_rd10_vs_wt)
+
+# Filter parameters enforcing padj < 0.1 criteria coupled with proportional baseline increases
+genes_up_rd1  <- rownames(df_rd1_vs_wt)[df_rd1_vs_wt$padj < 0.1 & df_rd1_vs_wt$log2FoldChange >  0]
+genes_up_rd10 <- rownames(df_rd10_vs_wt)[df_rd10_vs_wt$padj < 0.1 & df_rd10_vs_wt$log2FoldChange >  0]
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+entrez_rd1 <- bitr(
+  genes_up_rd1,
+  fromType   = "SYMBOL",
+  toType     = "ENTREZID",
+  OrgDb      = org.Mm.eg.db
+)$ENTREZID
+
+entrez_rd10 <- bitr(
+  genes_up_rd10,
+  fromType   = "SYMBOL",
+  toType     = "ENTREZID",
+  OrgDb      = org.Mm.eg.db
+)$ENTREZID
+```
+
+```{r echo=FALSE}
+# Perform GO Biological Process statistical derivation representing rd1
+ego_rd1 <- enrichGO(
+  gene          = entrez_rd1,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE   # Transpose internal ENTREZID configurations to standard notation
+)
+
+# Perform GO derivation representing rd10
+ego_rd10 <- enrichGO(
+  gene          = entrez_rd10,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+# Subset high priority integrated routes
+top10_rd1  <- as.data.frame(ego_rd1)[1:10,  ]
+top10_rd10 <- as.data.frame(ego_rd10)[1:10, ]
+
+# Output derivations
+cat("=== Top 10 GO BP in rd1 vs WT ===\n")
+print(top10_rd1[, c("ID", "Description", "GeneRatio", "p.adjust")])
+cat("\n=== Top 10 GO BP in rd10 vs WT ===\n")
+print(top10_rd10[, c("ID", "Description", "GeneRatio", "p.adjust")])
+
+```
+
+In both models, functional enrichment analysis highlights gliogenesis as a highly significant pathway. Additionally, processes related to the regulation of neurogenesis, cytoskeleton organization, and cell adhesion show significant divergence from healthy controls. These pathway shifts suggest widespread structural reorganization and strong glial reactivity in the degenerating retina.
+
+# Volcano Plot
+
+Volcano plots visually map transcriptomic differences between experimental groups. The horizontal axis represents the magnitude of gene expression changes, while the vertical axis indicates the statistical significance of those alterations.
+
+```{r echo=FALSE}
+# Map explicit representations rd1 vs WT
+df_volc_rd1 <- as.data.frame(resLFC_rd1_vs_wt)
+df_volc_rd1$gene <- rownames(df_volc_rd1)
+
+# Map explicit representations rd10 vs WT
+df_volc_rd10 <- as.data.frame(resLFC_rd10_vs_wt)
+df_volc_rd10$gene <- rownames(df_volc_rd10)
+
+```
+
+```{r warning=FALSE, include=FALSE}
+p_rd1 <- EnhancedVolcano(
+  df_volc_rd1,
+  lab            = df_volc_rd1$gene,
+  x              = "log2FoldChange",
+  y              = "padj",
+  xlab           = bquote(~Log[2]~ "(Fold Change)"),
+  ylab           = bquote(~-Log[10]~ "(adj P-value)"),
+  pCutoff        = 0.05,
+  FCcutoff       = 1,
+  pointSize      = 2.0,
+  labSize        = 3.0,
+  title          = "rd1 vs WT",
+  subtitle       = "padj < 0.05, |log2FC| > 1",
+  caption        = "Upregulated targets represented in red",
+  drawConnectors = TRUE,
+  max.overlaps   = 30
+)
+
+p_rd10 <- EnhancedVolcano(
+  df_volc_rd10,
+  lab            = df_volc_rd10$gene,
+  x              = "log2FoldChange",
+  y              = "padj",
+  xlab           = bquote(~Log[2]~ "(Fold Change)"),
+  ylab           = bquote(~-Log[10]~ "(adj P-value)"),
+  pCutoff        = 0.05,
+  FCcutoff       = 1,
+  pointSize      = 2.0,
+  labSize        = 3.0,
+  title          = "rd10 vs WT",
+  subtitle       = "padj < 0.05, |log2FC| > 1",
+  caption        = "Upregulated targets represented in red",
+  drawConnectors = TRUE,
+  max.overlaps   = 30
+)
+
+p_rd1 + p_rd10 + plot_layout(ncol = 2, guides = "collect") & theme(legend.position = "bottom")
+```
+
+![Volcano plot of differentially expressed genes in rd1 and rd10 retinopathy models compared to wild-type (WT) controls. The x-axis represents the log2 fold change of gene expression, and the y-axis indicates the statistical significance (-log10 of the adjusted p-value). Each point represents a single gene. The vertical dashed lines indicate the fold change threshold (\|log2FC\| \> 1), and the horizontal dashed line marks the significance threshold (padj \< 0.05). Genes highlighted in red represent upregulated targets meeting both criteria. Analysis performed using DESeq2 with shrinkage adjustment.](000014.png)
+
+The generated plot can serve as a preliminary map to help index potential shifts between the wild-type baseline and the degenerative models. Variables positioned in the upper right quadrant might indicate components with higher relative expression. The presence of established structural indicators in these regions, if observed, could lend support to the model's validity. This approach may help prioritize potential biological targets, offering a possible avenue to identify specific regulatory species for further validation using standard IHC techniques.
+
+# Conclusions
+
+This pipeline serves as a proof of concept. While the pathways for retinal gliosis and progressive tissue degeneration are well-documented in these models, integrating high-dimensional transcriptomics may provide deeper functional insights.
+
+The analysis suggests that it is feasible to explore potential regulatory components and identify candidate IHC targets using a standard 16 GB laptop and publicly available RNA-seq data. Applying appropriate memory management and garbage collection routines can help maintain stability within these hardware constraints. Furthermore, exploring aggregated databases allows for broader cross-referencing, which might help reduce reliance on established markers and offer alternative, data-driven avenues for discovering and validating new targets in complex retinopathies.
